@@ -1,0 +1,14 @@
+v build rocksandra ami
+v multi node ndbench cluster
+v ebs volumn support
+v better default ndbnech config
+v benchmark with cassandra stress-tool
+v switch to xfs
+v remove or sample backfill log otherwise it fills up disk quickly
+o use /etc/cassandra/conf/default.conf/jvm.option replace /etc/default/cassandra
+* lockdown instanceprofile permissions
+* setup security group
+* friendly cli (maybe rake)
+* export cassandra metrics to cloudwatch
+* install jmxterm or jmxsh
+

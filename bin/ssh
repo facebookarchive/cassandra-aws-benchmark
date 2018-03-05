@@ -1,0 +1,22 @@
+#!/bin/bash
+
+# Connect or execute ssh command in single hosts with specified named tag and index
+# usage:
+#  ssh into first cassandra node
+#  ./bin/ssh ~/.ssh/sshkey mystackname/cassandra 1
+#  execute `nodetool status` on second cassandra node
+#  ./bin/ssh ~/.ssh/sshkey mystackname/cassandra 2 "nodetool status"
+
+host=$(aws ec2 describe-instances \
+  --filters Name=tag:Name,Values=$2 Name=instance-state-name,Values=running\
+  | jq -r ".Reservations[] | .Instances[] | .PublicDnsName" \
+  | head -n$3 \
+  | tail -n1)
+
+ssh \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null \
+  -i $1 ec2-user@$host \
+  "$4"
+
+

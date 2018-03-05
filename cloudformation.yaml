@@ -1,0 +1,512 @@
+#
+# Copyright 2018-present, Facebook, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CF template for provision single DC cassandra cluster for benchmark purpose
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+    Default: sshkey
+  NoneSeedFleetSize:
+    Type: Number
+    Description: Number of nodes that is not seed. ClusterSize=NoneSeedFleetSize+1
+    Default: '2'
+  InstanceType:
+    Description: Node EC2 instance type
+    Type: String
+    Default: i3.xlarge
+    AllowedValues:
+      - i3.xlarge
+      - i3.2xlarge
+      - i3.4xlarge
+      - i3.8xlarge
+      - i3.16xlarge
+    ConstraintDescription: must be a valid EC2 instance type.
+  AWSRegion:
+    Type: String
+    Description: Which aws region we should use
+    Default: us-west-2
+  CassandraAMI:
+    Type: String
+    Description: Cassandra AMI ID. Make sure you use the one corresponding to the
+      region setting
+    Default: ami-9fd06fe7
+  BencherAMI:
+    Type: String
+    Description: NDBnech AMI ID. Make sure you use the one corresponding to the region
+      setting
+    Default: ami-4aab1432
+  BencherInstanceType:
+    Description: EC2 instance type for Bencher node
+    Type: String
+    Default: c5.2xlarge
+  BencherFleetSize:
+    Type: Number
+    Description: Number of bencher nodes for generating load
+    Default: '4'
+  VPCSubnetId:
+    Type: String
+    Description: VPC subnet id you want to all machines located to
+  ResourceGroup:
+    Type: String
+    Description: Add group tag for your resources for easier to manage
+    Default: ig_benchmark
+  InstanceProfile:
+    Type: String
+    Description: Name of a precreated instance profile that has permission to ec2::Describ* and autoscalegroup::Describe*
+
+Mappings:
+  Scripts:
+    Cassandra:
+      DiskMount: |
+        #!/bin/bash
+        set -x -e
+        mount_options=rw,noatime,attr2,inode64,allocsize=64k,noquota
+        disk_count=$(find /dev/ -name "nvme*n1" -type b | wc -l)
+        disk_list=$(find /dev/ -name "nvme*n1" -type b | xargs)
+        if [ $disk_count == "1" ];
+        then
+          # i3.xlarge, i3.2xlarge only have one disk, so just format and mount it
+          mkfs.xfs -s size=4096 $disk_list
+          mount -o $mount_options $disk_list /var/lib/cassandra
+        else
+          # on i3.4xlarge and above setup raid0 to max flash throughput
+          mdadm --create --verbose --level=0 /dev/md0 --name=DATA --raid-devices=$disk_count $disk_list
+          set +e
+          mdadm --wait /dev/md0
+          set -e
+          mkfs.xfs -s size=4096 /dev/md0
+          mount -o $mount_options /dev/md0 /var/lib/cassandra
+        fi
+        mkdir /var/lib/cassandra/{data,commitlog,hints,saved_caches}
+        chown -R cassandra:cassandra /var/lib/cassandra
+
+      SetupSchema: |
+        #!/bin/bash
+        set -x -e
+
+        /usr/bin/cqlsh -e \
+        "CREATE KEYSPACE IF NOT EXISTS dev1 \
+        WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': '1'} \
+        AND durable_writes = true;"
+
+        # skip C* WAL for rocksandra since rocks db already have one.
+        if grep -q cassandra.rocksdb /etc/cassandra/default.conf/jvm.options
+        then
+          /usr/bin/cqlsh -e "ALTER KEYSPACE dev1 with durable_writes = false;"
+        fi
+
+        /usr/bin/cqlsh -e \
+        "CREATE TABLE IF NOT EXISTS dev1.emp ( \
+        emp_uname text PRIMARY KEY, \
+        emp_dept text, \
+        emp_first text, \
+        emp_last text \
+        );"
+
+      ConfigLocalIp: >-
+        sed -i "s|__REPLACE_WITH_LOCAL_IP__|`curl -s http://169.254.169.254/latest/meta-data/local-ipv4`|g" /etc/cassandra/default.conf/cassandra.yaml
+
+      ConfigSeedIpsOnSeedItself: >-
+        sed -i "s|__REPLACE_WITH_SEED_IPS__|`curl -s http://169.254.169.254/latest/meta-data/local-ipv4`|g" /etc/cassandra/default.conf/cassandra.yaml
+
+      ConfigNumTokens: >-
+        sed -i "s|__REPLACE_WITH_NUM_TOKENS__|256|g" /etc/cassandra/default.conf/cassandra.yaml
+
+      ConfigHeapSize: |
+        #!/bin/bash
+        set -x -e
+
+        # heap_cap is max memory we can use. for rocksandar we set it to 12g since
+        # memtables are hold in rocksdb
+        if grep -q cassandra.rocksdb /etc/cassandra/default.conf/jvm.options
+        then
+          heap_cap=12288
+        else
+          heap_cap=65532
+        fi
+        # set heap size to 1/4 of system memory, cap to $heap_cap
+        system_memory_in_mb=`free -m | awk '/:/ {print $2;exit}'`
+        heap_size_in_mb=`expr $system_memory_in_mb / 4`
+        if [ "$heap_size_in_mb" -gt "$heap_cap" ]
+        then
+          heap_size_in_mb="$heap_cap"
+        fi
+        # write new setting to config
+        echo "\n" >> /etc/cassandra/default.conf/jvm.options
+        echo "-Xms${heap_size_in_mb}M" >> /etc/cassandra/default.conf/jvm.options
+        echo "-Xmx${heap_size_in_mb}M" >> /etc/cassandra/default.conf/jvm.options
+
+
+Outputs:
+  CassandraSeedNode:
+    Description: Public IP of cassandra seed node
+    Value:
+      Fn::GetAtt:
+        - SeedNodeInstance
+        - PublicIp
+
+Resources:
+  # setup single ec2 instance as seed node
+  SeedNodeInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      EbsOptimized: 'true'
+      KeyName: !Ref KeyName
+      ImageId: !Ref CassandraAMI
+      SubnetId: !Ref VPCSubnetId
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: >-
+              ${AWS::StackName}/cassandra
+        - Key: group
+          Value: !Ref ResourceGroup
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #! /bin/bash -v
+            # Helper function
+            function error_exit
+            {
+              /opt/aws/bin/cfn-signal -e 1 -r "$1" '${CassandraSeedWaitHandle}'
+              exit 1
+            }
+            # Install packages
+            /opt/aws/bin/cfn-init -s ${AWS::StackId} -r SeedNodeInstance --region ${AWS::Region}
+            # All is well so signal success
+            /opt/aws/bin/cfn-signal -e $? -r "SeedNodeInstance setup complete" '${CassandraSeedWaitHandle}'
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - configure_hosts
+            - configure_cassandra
+            - start_service
+            - setup_schema
+        configure_hosts:
+          commands:
+            01-create_hosts_entry-on_boot:
+              command: echo "`curl -s http://169.254.169.254/latest/meta-data/local-ipv4` `hostname`" >>/etc/hosts
+              test: test ! -f .create_hosts_entry-semaphore
+            02-signal_startup_complete:
+              command: touch .create_hosts_entry-semaphore
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content:
+                Fn::Sub: |
+                  [main]
+                  stack=${AWS::StackId}
+                  region=${AWS::Region}
+                  interval=1
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content:
+                Fn::Sub: |
+                  [cfn-auto-reloader-hook]
+                  triggers=post.update
+                  path=Resources.SeedNodeInstance.Metadata.AWS::CloudFormation::Init
+                  action=/opt/aws/bin/cfn-init -v -s ${AWS::StackId} --resource SeedNodeInstance --configsets default --region ${AWS::Region}
+                  runas=root
+              mode: '000400'
+              owner: root
+              group: root
+        configure_cassandra:
+          commands:
+            01-config_local_ip:
+              command: !FindInMap [ Scripts, Cassandra, ConfigLocalIp ]
+            02-config_seed_ips:
+              command: !FindInMap [ Scripts, Cassandra, ConfigSeedIpsOnSeedItself ]
+            03-config_tokens:
+              command: !FindInMap [ Scripts, Cassandra, ConfigNumTokens ]
+            04_config_heap:
+              command: !FindInMap [ Scripts, Cassandra, ConfigHeapSize ]
+            05_mount_data_disk:
+              command: !FindInMap [ Scripts, Cassandra, DiskMount ]
+        start_service:
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+          commands:
+            01-restart-cassandra:
+              command: /sbin/service cassandra restart
+        setup_schema:
+          commands:
+            01-wait-for-serverup:
+              command: /bin/sleep 120
+            02-schema:
+              command: !FindInMap [ Scripts, Cassandra, SetupSchema ]
+
+  CassandraSeedWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  CassandraSeedWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: SeedNodeInstance
+    Properties:
+      Handle:
+        Ref: CassandraSeedWaitHandle
+      Timeout: '3600'
+
+  # setup auto scaling group for none seed nodes
+  CassandraNonSeedFleet:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: CassandraSeedWaitCondition
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: '1'
+        MinInstancesInService: '0'
+        PauseTime: PT0M30S
+    Properties:
+      LaunchConfigurationName: !Ref CassandraNonSeedLaunchConfig
+      MinSize: !Ref NoneSeedFleetSize
+      MaxSize: !Ref NoneSeedFleetSize
+      DesiredCapacity: !Ref NoneSeedFleetSize
+      VPCZoneIdentifier: [ !Ref VPCSubnetId ]
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: >-
+              ${AWS::StackName}/cassandra
+          PropagateAtLaunch: 'true'
+        - Key: group
+          Value: !Ref ResourceGroup
+          PropagateAtLaunch: 'true'
+
+
+  CassandraNonSeedLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      InstanceType: !Ref InstanceType
+      EbsOptimized: 'true'
+      KeyName: !Ref KeyName
+      ImageId: !Ref CassandraAMI
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #! /bin/bash -v
+            yum update -y
+            # Helper function
+            function error_exit
+            {
+              /opt/aws/bin/cfn-signal -e 1 -r "$1" '${CassandraNonSeedWaitHandle}'
+              exit 1
+            }
+            # Install packages
+            /opt/aws/bin/cfn-init -s ${AWS::StackId} -r CassandraNonSeedLaunchConfig --region ${AWS::Region}
+            # All is well so signal success
+            /opt/aws/bin/cfn-signal -e $? -r "Cassandra instance setup complete" '${CassandraNonSeedWaitHandle}'
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - configure_hosts
+            - configure_cassandra
+            - start_service
+        configure_hosts:
+          commands:
+            01-create_hosts_entry-on_boot:
+              command: echo "`curl -s http://169.254.169.254/latest/meta-data/local-ipv4` `hostname`" >>/etc/hosts
+              test: test ! -f .create_hosts_entry-semaphore
+            02-signal_startup_complete:
+              command: touch .create_hosts_entry-semaphore
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content:
+                Fn::Sub: |
+                  [main]
+                  stack=${AWS::StackId}
+                  region=${AWS::Region}
+                  interval=1
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content:
+                Fn::Sub: |
+                  [cfn-auto-reloader-hook]
+                  triggers=post.update
+                  path=Resources.CassandraNonSeedLaunchConfig.Metadata.AWS::CloudFormation::Init
+                  action=/opt/aws/bin/cfn-init -v -s ${AWS::StackId} --resource CassandraNonSeedLaunchConfig --configsets default --region ${AWS::Region}
+                  runas=root
+              mode: '000400'
+              owner: root
+              group: root
+        configure_cassandra:
+          commands:
+            01-config_local_ip:
+              command: !FindInMap [ Scripts, Cassandra, ConfigLocalIp ]
+            02-config_seed_ips:
+              command:
+                Fn::Sub: >-
+                  sed -i "s|__REPLACE_WITH_SEED_IPS__|${SeedNodeInstance.PrivateIp}|g" /etc/cassandra/default.conf/cassandra.yaml
+            03-config_tokens:
+              command: !FindInMap [ Scripts, Cassandra, ConfigNumTokens ]
+            04_config_heap:
+              command: !FindInMap [ Scripts, Cassandra, ConfigHeapSize ]
+            05_mount_data_disk:
+              command: !FindInMap [ Scripts, Cassandra, DiskMount ]
+        start_service:
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+          commands:
+            01-restart-cassandra:
+              command: /sbin/service cassandra restart
+  CassandraNonSeedWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  CassandraNonSeedWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: CassandraNonSeedFleet
+    Properties:
+      Handle:
+        Ref: CassandraNonSeedWaitHandle
+      Timeout: '3600'
+      Count: '1'
+
+  # setup auto scaling group for multiple bencher nodes with ndbench
+  BencherFleet:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: CassandraNonSeedWaitCondition
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: "2"
+        MinInstancesInService: '0'
+        PauseTime: PT5S
+    Properties:
+      VPCZoneIdentifier: [ !Ref VPCSubnetId ]
+      LaunchConfigurationName: !Ref BencherLaunchConfig
+      MinSize: !Ref BencherFleetSize
+      MaxSize: !Ref BencherFleetSize
+      DesiredCapacity: !Ref BencherFleetSize
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: >-
+              ${AWS::StackName}/bencher
+          PropagateAtLaunch: 'true'
+        - Key: group
+          Value: !Ref ResourceGroup
+          PropagateAtLaunch: 'true'
+
+
+  BencherLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      InstanceType: !Ref BencherInstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      KeyName: !Ref KeyName
+      ImageId: !Ref BencherAMI
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #! /bin/bash -v
+            # Helper function
+            function error_exit
+            {
+              /opt/aws/bin/cfn-signal -e 1 -r "$1" '${BencherWaitHandle}'
+              exit 1
+            }
+            # Install packages
+            /opt/aws/bin/cfn-init -s ${AWS::StackId} -r BencherLaunchConfig --region ${AWS::Region}
+            # All is well so signal success
+            /opt/aws/bin/cfn-signal -e $? -r "bencher setup complete. Last error: $(grep ERROR /var/log/cfn-init.log | tail -n 1)" '${BencherWaitHandle}'
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - configure_hosts
+            - configure_ndbench
+            - start_service
+        configure_hosts:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content:
+                Fn::Sub: |-
+                  [main]
+                  stack=${AWS::StackId}
+                  region=${AWS::Region}
+                  interval=1
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content:
+                Fn::Sub: |
+                  [cfn-auto-reloader-hook]
+                  triggers=post.update
+                  path=Resources.BencherLaunchConfig.Metadata.AWS::CloudFormation::Init
+                  action=/opt/aws/bin/cfn-init -v -s ${AWS::StackId} --resource BencherLaunchConfig --configsets default --region ${AWS::Region}
+                  runas=root
+              mode: '000400'
+              owner: root
+              group: root
+        configure_ndbench:
+          files:
+            /etc/sysconfig/tomcat8:
+              content:
+                Fn::Sub: |
+                  export DISCOVERY_ENV=AWS_ASG
+                  export JAVA_OPTS="$JAVA_OPTS -Dndbench.config.dataSize=2000"
+                  export JAVA_OPTS="$JAVA_OPTS -Dndbench.config.numBackfill=64"
+                  export JAVA_OPTS="$JAVA_OPTS -Dndbench.config.numKeys=250000000"
+                  export JAVA_OPTS="$JAVA_OPTS -Dndbench.config.numReaders=64"
+                  export JAVA_OPTS="$JAVA_OPTS -Dndbench.config.numValues=100"
+                  export JAVA_OPTS="$JAVA_OPTS -Dndbench.config.numWriters=64"
+                  export JAVA_OPTS="$JAVA_OPTS -Dndbench.config.readRateLimit=10000"
+                  export JAVA_OPTS="$JAVA_OPTS -Dndbench.config.writeRateLimit=10000"
+                  export JAVA_OPTS="$JAVA_OPTS -Dndbench.config.cass.cluster=benchmark"
+                  export JAVA_OPTS="$JAVA_OPTS -Dndbench.config.cass.host=${SeedNodeInstance.PrivateIp}"
+              mode: '000644'
+              owner: root
+              group: root
+        start_service:
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+          commands:
+            01-restart-tomcat:
+              command: /sbin/service tomcat8 restart
+
+  BencherWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  BencherWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: BencherFleet
+    Properties:
+      Handle:
+        Ref: BencherWaitHandle
+      Timeout: '3600'
+      Count: '1'

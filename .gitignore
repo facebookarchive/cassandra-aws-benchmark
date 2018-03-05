@@ -1,0 +1,3 @@
+.DS_Store
+/ami/cassandra3/resources/cassandra.rpm
+/ami/rocksandra/resources/rocksandra.rpm

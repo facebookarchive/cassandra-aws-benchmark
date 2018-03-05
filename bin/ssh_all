@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# Execute command via ssh in all cassandra or bencher instances
+# usage:
+#  ./bin/ssh_all ~/.ssh/sshkey mystackname/cassandra "nodetool info"
+#  ./bin/ssh_all ~/.ssh/sshkey mystackname/bencher "tail -n 5 /var/log/ndbench/ndbench.log"
+
+aws ec2 describe-instances \
+  --filters Name=tag:Name,Values=$2 Name=instance-state-name,Values=running \
+  | jq -r ".Reservations[] | .Instances[] | .PublicDnsName" \
+  | xargs -I{} ssh \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null \
+  -i $1 ec2-user@{} \
+  "$3"

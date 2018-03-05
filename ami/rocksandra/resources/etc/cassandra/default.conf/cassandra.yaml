@@ -1,0 +1,108 @@
+#
+# Copyright 2018-present, Facebook, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+auto_bootstrap: true
+authenticator: AllowAllAuthenticator
+authorizer: AllowAllAuthorizer
+auto_snapshot: true
+client_encryption_options:
+  enabled: false
+  keystore: conf/.keystore
+  keystore_password: cassandra
+cluster_name: benchmark
+commitlog_segment_size_in_mb: 32
+commitlog_sync: periodic
+commitlog_sync_period_in_ms: 10000
+commitlog_total_space_in_mb: 4096
+compaction_throughput_mb_per_sec: 150
+concurrent_reads: 32
+concurrent_writes: 32
+concurrent_compactors: 4
+cross_node_timeout: true
+disk_failure_policy: stop
+dynamic_snitch_badness_threshold: 0.25
+dynamic_snitch_reset_interval_in_ms: 600000
+dynamic_snitch_update_interval_in_ms: 100
+endpoint_snitch: GossipingPropertyFileSnitch
+hinted_handoff_enabled: true
+max_hints_delivery_threads: 4
+max_hint_window_in_ms: 14400000
+hinted_handoff_throttle_in_kb: 5120
+incremental_backups: false
+inter_dc_tcp_nodelay: true
+internode_compression: dc
+key_cache_keys_to_save: 0
+key_cache_save_period: 14400
+key_cache_size_in_mb: 512
+listen_address: "__REPLACE_WITH_LOCAL_IP__"
+disk_access_mode: mmap_index_only
+native_transport_port: 9042
+num_tokens: __REPLACE_WITH_NUM_TOKENS__
+partitioner: org.apache.cassandra.dht.Murmur3Partitioner
+phi_convict_threshold: 8
+range_request_timeout_in_ms: 10000
+read_request_timeout_in_ms: 4000
+request_scheduler: org.apache.cassandra.scheduler.NoScheduler
+request_timeout_in_ms: 10000
+row_cache_save_period: 0
+row_cache_size_in_mb: 0
+rpc_address: '0.0.0.0'
+rpc_keepalive: true
+rpc_max_threads: 8
+rpc_min_threads: 8
+rpc_port: 9160
+rpc_server_type: hsha
+seed_provider:
+    - class_name: org.apache.cassandra.locator.SimpleSeedProvider
+      parameters:
+          - seeds: "__REPLACE_WITH_SEED_IPS__"
+server_encryption_options:
+  internode_encryption: none
+  keystore: conf/.keystore
+  keystore_password: cassandra
+  truststore: conf/.truststore
+  truststore_password: cassandra
+snapshot_before_compaction: false
+ssl_storage_port: 7001
+start_native_transport: true
+start_rpc: true
+storage_port: 7000
+thrift_framed_transport_size_in_mb: 512
+trickle_fsync_interval_in_kb: 10240
+trickle_fsync: true
+truncate_request_timeout_in_ms: 60000
+write_request_timeout_in_ms: 4000
+thrift_max_message_length_in_mb: 512
+memtable_allocation_type: heap_buffers
+broadcast_rpc_address: "__REPLACE_WITH_LOCAL_IP__"
+batchlog_replay_throttle_in_kb: 1024
+streaming_socket_timeout_in_ms: 86400000
+tombstone_failure_threshold: 100000
+tombstone_warn_threshold: 10000
+sstable_preemptive_open_interval_in_mb: 50
+batch_size_warn_threshold_in_kb: 300
+batch_size_fail_threshold_in_kb: 500
+commit_failure_policy: stop
+concurrent_counter_writes: 128
+counter_cache_keys_to_save: 100
+counter_cache_save_period: 7200
+counter_cache_size_in_mb: 0
+counter_write_request_timeout_in_ms: 5000
+memtable_cleanup_threshold: 0.66
+data_file_directories:
+- "/var/lib/cassandra/data"
+commitlog_directory: "/var/lib/cassandra/commitlog"
+saved_caches_directory: "/var/lib/cassandra/saved_caches"
+hints_directory: "/var/lib/cassandra/hints"
